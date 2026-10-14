@@ -1,0 +1,20 @@
+{
+  "manifest_version": 2,
+  "name": "Copy & Paste Unblocker",
+  "version": "1.0",
+  "description": "F8 copies the selection (with formatting) even where Ctrl+C is blocked. F9 pastes it with the same formatting. F7 forces text selection.",
+  "browser_specific_settings": {
+    "gecko": { "id": "copy-paste-unblocker@local" }
+  },
+  "permissions": ["storage", "clipboardWrite", "<all_urls>"],
+  "background": { "scripts": ["background.js"] },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_about_blank": true
+    }
+  ]
+}

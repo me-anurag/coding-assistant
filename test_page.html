@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Copy/Paste Blocker Test Page</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 30px auto; padding: 0 16px; }
+  h3 { margin-top: 26px; }
+  textarea, input { width: 100%; box-sizing: border-box; font-size: 16px; padding: 8px; margin: 6px 0 12px; }
+  .box { border: 1px solid #aaa; border-radius: 6px; padding: 10px; }
+  #rich { min-height: 120px; }
+  #log { color: #b00; min-height: 1.4em; }
+</style>
+</head>
+<body>
+  <h2>Copy/Paste Blocker Test Page</h2>
+
+  <h3>A. Source: only the Ctrl+C shortcut is blocked (F8 should work)</h3>
+  <div id="srcA" class="box">
+    <p>Normal text, <b>bold</b>, <i>italic</i>, <u>underlined</u>.</p>
+    <ul><li>First item</li><li>Second item</li></ul>
+    <ol><li>Step one</li><li>Step two</li></ol>
+  </div>
+
+  <h3>B. Source: the copy action itself is blocked (F8 will report it cannot copy)</h3>
+  <div id="srcB" class="box"><b>Locked</b> text that blocks every copy method.</div>
+
+  <h3>Targets: paste is blocked (click in, press F9)</h3>
+  <label>Single line</label>
+  <input id="a" type="text">
+  <label>Multi line (plain text)</label>
+  <textarea id="b" rows="4"></textarea>
+  <label>Rich editor (should keep bold / italic / underline)</label>
+  <div id="rich" class="box" contenteditable="true"></div>
+
+  <div id="log"></div>
+
+<script>
+  const log = document.getElementById('log');
+  const say = m => log.textContent = m;
+
+  // B: block the copy event entirely
+  document.getElementById('srcB').addEventListener('copy', e => { e.preventDefault(); say('Blocked a copy event (B).'); });
+  document.getElementById('srcB').addEventListener('cut', e => e.preventDefault());
+
+  // Targets: block paste and drop
+  for (const el of document.querySelectorAll('input, textarea, #rich')) {
+    for (const ev of ['paste', 'drop']) {
+      el.addEventListener(ev, e => { e.preventDefault(); say('Blocked a ' + ev + ' attempt.'); });
+    }
+  }
+  // Block the keyboard shortcuts only
+  document.addEventListener('keydown', e => {
+    const k = e.key.toLowerCase();
+    if ((e.ctrlKey || e.metaKey) && (k === 'v' || k === 'c' || k === 'x')) { e.preventDefault(); say('Blocked Ctrl+' + k.toUpperCase()); }
+    if (e.shiftKey && e.key === 'Insert') e.preventDefault();
+  });
+</script>
+</body>
+</html>
