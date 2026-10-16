@@ -78,7 +78,8 @@ def foreground_is_ide():
 IS_WIN = sys.platform == "win32"
 PLAIN = (False, False, False)
 FMT_KEYS = ("b", "i", "u")
-SLOTS = ("q", "co")
+SLOTS = ("q", "co")                 # buttons that just store the clipboard
+ALL_SLOTS = ("q", "co", "cc", "er")   # everything the app keeps in memory
 
 
 # ---------- Windows clipboard helpers ----------
@@ -124,7 +125,9 @@ def clipboard_seq():
 
 # ---------- the floating strip ----------
 class Strip:
-    BG = "#1e1e1e"
+    BG = "#3c3c3c"
+    KEY = "#010203"         # becomes see-through (Windows) while collapsed to the circle
+    TYPE_COLORS = {"vs": "#1a56c4", "ot": "#b35c00"}      # vs / ot text colour on the light header
     FG = "#ffffff"          # buttons stay white; the dot after the name shows "stored"
     BAD = "#ff5555"
 
@@ -140,6 +143,16 @@ class Strip:
         self.bar.pack(side="top", anchor="w")
 
         self.labels = {}
+        self.fgs = {}                         # per-button normal text colour (default: white)
+        self.collapsed = False
+        self._hidden = []
+        self.dot = tk.Canvas(self.bar, width=18, height=18, bg=self.BG, highlightthickness=0, cursor="hand2")
+        self.dot_item = self.dot.create_text(9, 9, text="C", fill="#ffffff", font=("Segoe UI", 10, "bold"))
+        self.dot.pack(side="left", padx=(4, 2), pady=2)
+        self.dot.bind("<ButtonPress-1>", self._dot_press)
+        self.dot.bind("<B1-Motion>", self._dot_move)
+        self.dot.bind("<ButtonRelease-1>", self._dot_release)
+
         grip = tk.Label(self.bar, text="\u22ee", bg=self.BG, fg="#777", font=("Segoe UI", 9), cursor="fleur")
         grip.pack(side="left", padx=(3, 0))
         grip.bind("<ButtonPress-1>", self._drag_start)
@@ -163,11 +176,6 @@ class Strip:
         xb.pack(side="left")
         xb.bind("<Button-1>", lambda e: self.toggle_box("x"))
 
-        self.type_lb = tk.Label(self.bar, text="vs", bg=self.BG, fg="#8ab4ff", font=("Segoe UI", 9, "bold"),
-                                padx=5, pady=1, cursor="hand2")
-        self.type_lb.pack(side="left")
-        self.type_lb.bind("<Button-1>", lambda e: app.toggle_editor_type())
-
         nxt = tk.Label(self.bar, text=">", bg=self.BG, fg="#8ab4ff", font=("Segoe UI", 9, "bold"),
                        padx=5, pady=1, cursor="hand2")
         nxt.pack(side="left", padx=(0, 3))
@@ -182,13 +190,42 @@ class Strip:
         self.vsb = tk.Scrollbar(self.box, orient="vertical", command=self.text.yview, width=12)
         self.hsb = tk.Scrollbar(self.box, orient="horizontal", command=self.text.xview, width=12)
         self.text.configure(yscrollcommand=self.vsb.set, xscrollcommand=self.hsb.set)
-        self.text.grid(row=0, column=0, sticky="nsew")
-        self.vsb.grid(row=0, column=1, sticky="ns")
-        self.hsb.grid(row=1, column=0, sticky="ew")
+        self.head = tk.Frame(self.box, bg="#e9e9e9")          # shown for the answer / review views only
+        self.re_lb = tk.Label(self.head, text="re", bg="#e9e9e9", fg="#000000", font=("Segoe UI", 9, "bold"),
+                              padx=6, cursor="hand2")
+        self.re_lb.pack(side="left")
+        self.re_lb.bind("<Button-1>", lambda e: app.retry_current())
+        for name, handler in (("cc", app.press_cc), ("er", lambda: app.store_slot("er")), (">>", app.submit_review)):
+            lb = tk.Label(self.head, text=name, bg="#e9e9e9", fg="#000000", font=("Segoe UI", 9, "bold"),
+                          padx=6, cursor="hand2")
+            lb.pack(side="left")
+            lb.bind("<Button-1>", lambda e, h=handler: h())
+            if name in ("cc", "er"):                       # right-click = clear that slot
+                lb.bind("<Button-3>", lambda e, n=name: app.clear_slot(n))
+            self.labels[name] = lb
+            self.fgs[name] = "#000000"                      # dark text: the header is light, the strip is dark
+        self.cap_lb = tk.Label(self.head, text="", bg="#e9e9e9", fg="#666666", font=("Segoe UI", 8), padx=6)
+        self.cap_lb.pack(side="right")
+        self.head.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.head.grid_remove()
+
+        # header row for the x view: the typing-format button (vs / ot)
+        self.xhead = tk.Frame(self.box, bg="#e9e9e9")
+        self.type_lb = tk.Label(self.xhead, text="vs", bg="#e9e9e9", fg=self.TYPE_COLORS["vs"],
+                                font=("Segoe UI", 9, "bold"), padx=6, cursor="hand2")
+        self.type_lb.pack(side="left")
+        self.type_lb.bind("<Button-1>", lambda e: app.toggle_editor_type())
+        tk.Label(self.xhead, text="typing format", bg="#e9e9e9", fg="#666666", font=("Segoe UI", 8),
+                 padx=6).pack(side="right")
+        self.xhead.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.xhead.grid_remove()
+        self.text.grid(row=1, column=0, sticky="nsew")
+        self.vsb.grid(row=1, column=1, sticky="ns")
+        self.hsb.grid(row=2, column=0, sticky="ew")
         self.text.bind("<MouseWheel>", self._wheel)
         self.text.bind("<Shift-MouseWheel>", self._hwheel)
         self.box_visible = False
-        self.box_src = None                      # "x" = clipboard text, "A" = AI answer
+        self.box_src = None                      # "x" = clipboard, "A" = AI answer, "R" = review of your solution
         self._shown = None
         self._poll_id = None
 
@@ -212,7 +249,7 @@ class Strip:
         longest = max(len(l) for l in lines)
         cw = max(1, self.font.measure("0"))
         cap = max(20, (self.win.winfo_screenwidth() - 80) // cw)
-        self.text.config(width=max(12, min(longest, cap)))
+        self.text.config(width=max(16, min(longest, cap)))
         self.text.config(state="normal")
         self.text.delete("1.0", "end")
         self.text.insert("1.0", shown)
@@ -252,16 +289,26 @@ class Strip:
         self.box.pack_forget()
         self._stop_poll()
 
-    def show(self, src, raw=None):
-        """Open the box (or switch it) to 'x' (clipboard) or 'A' (AI answer)."""
+    def set_tries(self, n):
+        self.re_lb.config(text=f"re({n})" if n else "re")
+
+    def show(self, src, raw=None, tries=0):
+        """Open the box (or switch it): 'x' = clipboard, 'A' = AI answer, 'R' = review of your solution."""
         self._stop_poll()
         self.box_src = src
         if src == "x":
+            self.head.grid_remove()
+            self.xhead.grid()
             self.fill()
         else:
-            self.render(raw or "", "(no answer yet)")
+            self.xhead.grid_remove()
+            self.head.grid()
+            self.set_tries(tries)
+            self.cap_lb.config(text="answer" if src == "A" else "review (cc)")
+            self.render(raw or "", "(nothing yet)")
         if not self.box_visible:
-            self.box.pack(side="top", anchor="w")
+            if not self.collapsed:                # while collapsed to the circle the box stays hidden
+                self.box.pack(side="top", anchor="w")
             self.box_visible = True
         if src == "x":
             self._poll_id = self.win.after(500, self._poll)
@@ -271,6 +318,57 @@ class Strip:
             self.collapse()
         else:
             self.show(src)
+
+    # ----- collapse to the circle / expand again -----
+    def _dot_press(self, e):
+        self._dx, self._dy = e.x_root - self.win.winfo_x(), e.y_root - self.win.winfo_y()
+        self._press_xy = (e.x_root, e.y_root)
+        self._moved = False
+
+    def _dot_move(self, e):                       # dragging the circle moves the strip; a plain click toggles
+        if abs(e.x_root - self._press_xy[0]) + abs(e.y_root - self._press_xy[1]) > 4:
+            self._moved = True
+        if self._moved:
+            self.win.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
+
+    def _dot_release(self, e):
+        if not self._moved:
+            self.toggle_collapsed()
+
+    def _set_bg(self, color):
+        for w in (self.win, self.bar, self.dot):
+            w.configure(bg=color)
+
+    def toggle_collapsed(self):
+        if not self.collapsed:
+            self.collapsed = True
+            self._hidden = [w for w in self.bar.winfo_children() if w is not self.dot]
+            self._infos = []
+            for w in self._hidden:
+                info = w.pack_info()
+                info.pop("in", None)
+                self._infos.append(info)
+                w.pack_forget()
+            if self.box_visible:
+                self.box.pack_forget()            # box_visible stays True: it comes back on expand
+            try:                                  # Windows: only the circle is visible, no dark box around it
+                self.win.attributes("-transparentcolor", self.KEY)
+                self._set_bg(self.KEY)
+            except tk.TclError:
+                pass
+        else:
+            self.collapsed = False
+            try:
+                self.win.attributes("-transparentcolor", "")
+            except tk.TclError:
+                pass
+            self._set_bg(self.BG)
+            for w, info in zip(self._hidden, self._infos):
+                w.pack(**info)
+            if self.box_visible:
+                self.box.pack(side="top", anchor="w")
+        self.win.update_idletasks()
+        self._make_noactivate()
 
     # ----- position / drag -----
     def reset_position(self):
@@ -316,15 +414,15 @@ class Strip:
 
     # ----- indicators -----
     def set_stored(self, name, stored):
-        self.labels[name].config(text=name + "\u2022" if stored else name, fg=self.FG)
+        self.labels[name].config(text=name + "\u2022" if stored else name, fg=self.fgs.get(name, self.FG))
 
     def set_type(self, etype):
-        self.type_lb.config(text=etype, fg="#8ab4ff" if etype == "vs" else "#ffb454")
+        self.type_lb.config(text=etype, fg=self.TYPE_COLORS[etype])
 
     def flash_error(self, name):
         lb = self.labels[name]
         lb.config(fg=self.BAD)
-        self.win.after(500, lambda: lb.config(fg=self.FG))
+        self.win.after(500, lambda: lb.config(fg=self.fgs.get(name, self.FG)))
 
     def set_visible(self, show):
         if show:
@@ -344,10 +442,19 @@ class App:
         self.kb = keyboard.Controller()
         self.stop_flag = threading.Event()
         self.busy = threading.Lock()
-        self.slots = {n: None for n in SLOTS}     # name -> typing plan
+        self.slots = {n: None for n in ALL_SLOTS}  # name -> typing plan
         self.answer = None                        # last AI answer (cleaned text)
         self.answer_key = None                    # (q_text, co_text) it was made from
+        self.answer_hist = []                     # every answer so far (for "re" = rethink)
+        self.answer_tries = 0                     # how many times "re" was used on the answer
+        self.review = None                        # last review of cc (+ er)
+        self.review_inputs = None                 # (q, co, cc, er) it was made from
+        self.review_hist = []
+        self.review_tries = 0
+        self._last_clip = None                    # clipboard text the last store button used
         self._asking = False
+        self._ask_kind = None
+        self._session = 0                         # bumped by ">" so old AI results are ignored
         self.editor_type = "vs"                   # "vs" = VS Code style, "ot" = other (keeps previous indent)
 
         root.title("Paste Helper - Settings")
@@ -477,7 +584,7 @@ class App:
 
     def refresh_slots(self):
         parts = []
-        for n in SLOTS:
+        for n in ALL_SLOTS:
             plan = self.slots[n]
             if plan:
                 chars = len(plan["text"])
@@ -511,7 +618,10 @@ class App:
             self.status.set(f"Nothing on the clipboard to store as {name}. Select text, press F8, then click {name}.")
             return
         self.slots[name] = plan
+        self._last_clip = plan["text"]
         self.strip.set_stored(name, True)
+        if name == "cc":
+            self._drop_review()                     # new solution: the old review no longer applies
         if self.answer_key != self._qco():
             self.strip.set_stored("A", False)       # inputs changed: the old answer no longer matches
         self.refresh_slots()
@@ -542,6 +652,29 @@ class App:
         q, co = self.slots["q"], self.slots["co"]
         return (q["text"] if q else ""), (co["text"] if co else "")
 
+    def clip_norm(self):
+        return self.get_clipboard().replace("\r\n", "\n").replace("\r", "\n")
+
+    def _run_ai(self, kind, func, on_done):
+        """Run func() in a thread, then on_done(result, error) in the UI thread (ignored after '>')."""
+        self._asking, self._ask_kind = True, kind
+        sess = self._session
+
+        def work():
+            try:
+                res, err = func(), None
+            except llm_helper.LLMError as e:
+                res, err = None, str(e)
+            except Exception as e:                  # never let the thread die silently
+                res, err = None, f"Unexpected error: {e}"
+
+            def finish():
+                if sess == self._session:
+                    on_done(res, err)
+            self.root.after(0, finish)
+        threading.Thread(target=work, daemon=True).start()
+
+    # --- A: answer ---
     def ask_answer(self):
         if self.strip.box_visible and self.strip.box_src == "A":
             self.strip.collapse()
@@ -552,39 +685,155 @@ class App:
             return
         key = (qt, ct)
         if self.answer is not None and self.answer_key == key:
-            self.strip.show("A", self.answer)
+            self.strip.show("A", self.answer, self.answer_tries)
             return
         if self._asking:
             self.strip.show("A", "Still thinking...")
             return
         self.strip.show("A", "Thinking...")
-        self._asking = True
         cfg = self.ai_config()
-        threading.Thread(target=self._ask_worker, args=(key, cfg), daemon=True).start()
+        self._run_ai("A", lambda: llm_helper.solve(key[0], key[1], cfg),
+                     lambda r, e: self._answer_done(key, r, e, False))
 
-    def _ask_worker(self, key, cfg):
-        try:
-            ans, err = llm_helper.solve(key[0], key[1], cfg), None
-        except llm_helper.LLMError as e:
-            ans, err = None, str(e)
-        except Exception as e:                      # never let the thread die silently
-            ans, err = None, f"Unexpected error: {e}"
-        self.root.after(0, lambda: self._ask_done(key, ans, err))
+    def retry_answer(self):
+        if self._asking:
+            self.status.set("Still thinking...")
+            return
+        if self.answer is None or self.answer_key is None:
+            return
+        qt, ct = self.answer_key
+        prev, cfg = list(self.answer_hist), self.ai_config()
+        self.strip.show("A", "Rethinking...", self.answer_tries)
+        self._run_ai("A", lambda: llm_helper.solve(qt, ct, cfg, previous=prev),
+                     lambda r, e: self._answer_done(self.answer_key, r, e, True))
 
-    def _ask_done(self, key, ans, err):
+    def _answer_done(self, key, ans, err, retry):
         self._asking = False
         showing = self.strip.box_visible and self.strip.box_src == "A"
         if err:
             if showing:
-                self.strip.show("A", "Error: " + err)
+                if retry and self.answer is not None:
+                    self.strip.show("A", self.answer, self.answer_tries)
+                else:
+                    self.strip.show("A", "Error: " + err)
             self.status.set("AI: " + err)
             return
-        self.answer, self.answer_key = ans, key
-        if key == self._qco():
+        if retry:
+            self.answer = ans
+            self.answer_hist.append(ans)
+            self.answer_tries += 1
+        else:
+            self.answer, self.answer_key = ans, key
+            self.answer_hist, self.answer_tries = [ans], 0
+        if self.answer_key == self._qco():
             self.strip.set_stored("A", True)
         if showing:
-            self.strip.show("A", ans)
+            self.strip.show("A", self.answer, self.answer_tries)
         self.status.set("AI answer ready. Click A to view it.")
+
+    # --- cc / er / >>: check my own solution ---
+    def _drop_review(self):
+        self.review = self.review_inputs = None
+        self.review_hist, self.review_tries = [], 0
+        self.strip.set_stored(">>", False)
+        if self.strip.box_src == "R":
+            self.strip.collapse()
+
+    def clear_slot(self, name):
+        self.slots[name] = None
+        self.strip.set_stored(name, False)
+        if name == "cc":
+            self._drop_review()
+        self.refresh_slots()
+        self.status.set(f"{name} cleared.")
+
+    def press_cc(self):
+        """cc stores what you just copied. If you have NOT copied anything new and a review exists
+        (or is being made), it flips the box between the review and the answer instead."""
+        clip = self.clip_norm()
+        fresh = bool(clip.strip()) and clip != self._last_clip
+        reviewing = self.review is not None or (self._asking and self._ask_kind == "R")
+        if reviewing and not fresh:
+            if self.strip.box_visible and self.strip.box_src == "R":
+                if self.answer is not None:
+                    self.strip.show("A", self.answer, self.answer_tries)
+                else:
+                    self.strip.collapse()
+            else:
+                text = self.review if self.review is not None else "Reviewing..."
+                self.strip.show("R", text, self.review_tries)
+            return
+        self.store_slot("cc")
+
+    def submit_review(self):
+        cc, er = self.slots["cc"], self.slots["er"]
+        if not cc:
+            self.strip.flash_error("cc")
+            self.strip.show("R", "Store your solution with cc first (select it, F8, click cc).")
+            return
+        qt, ct = self._qco()
+        inputs = (qt, ct, cc["text"], er["text"] if er else "")
+        old = self.review_inputs
+        if self.review is not None and old and old[:3] == inputs[:3] and inputs[3] in ("", old[3]):
+            self.strip.show("R", self.review, self.review_tries)    # same inputs: no new call
+            return
+        if self._asking:
+            self.strip.show("R", "Still thinking...")
+            return
+        cfg = self.ai_config()
+        self.strip.show("R", "Reviewing...")
+        self._run_ai("R", lambda: llm_helper.review(*inputs, cfg),
+                     lambda r, e: self._review_done(inputs, r, e, False))
+
+    def retry_review(self):
+        if self._asking:
+            self.status.set("Still thinking...")
+            return
+        if self.review is None or self.review_inputs is None:
+            return
+        inputs, prev, cfg = self.review_inputs, list(self.review_hist), self.ai_config()
+        self.strip.show("R", "Rethinking the review...", self.review_tries)
+        self._run_ai("R", lambda: llm_helper.review(*inputs, cfg, previous=prev),
+                     lambda r, e: self._review_done(inputs, r, e, True))
+
+    def _review_done(self, inputs, rev, err, retry):
+        self._asking = False
+        cur_cc = self.slots["cc"]["text"] if self.slots["cc"] else ""
+        if inputs[2] != cur_cc:
+            self.status.set("Review dropped: cc changed while it was thinking.")
+            return
+        showing = self.strip.box_visible and self.strip.box_src == "R"
+        if err:
+            if showing:
+                if retry and self.review is not None:
+                    self.strip.show("R", self.review, self.review_tries)
+                else:
+                    self.strip.show("R", "Error: " + err)
+            self.status.set("AI: " + err)
+            return
+        if retry:
+            self.review = rev
+            self.review_hist.append(rev)
+            self.review_tries += 1
+        else:
+            self.review, self.review_inputs = rev, inputs
+            self.review_hist, self.review_tries = [rev], 0
+            er = self.slots["er"]
+            if inputs[3] and er and er["text"] == inputs[3]:         # the error was used: clear it
+                self.slots["er"] = None
+                self.strip.set_stored("er", False)
+                self.refresh_slots()
+        self.strip.set_stored(">>", True)
+        if showing:
+            self.strip.show("R", self.review, self.review_tries)
+        self.status.set("Review ready." + ("" if showing else " Press cc to view it."))
+
+    def retry_current(self):
+        """The 're' button inside the box: retry whichever view is open."""
+        if self.strip.box_src == "A":
+            self.retry_answer()
+        elif self.strip.box_src == "R":
+            self.retry_review()
 
     def toggle_editor_type(self):
         self.editor_type = "ot" if self.editor_type == "vs" else "vs"
@@ -594,11 +843,17 @@ class App:
 
     def new_session(self):
         self.stop_flag.set()
-        self.slots = {n: None for n in SLOTS}
+        self._session += 1
+        self._asking = False
+        self.slots = {n: None for n in ALL_SLOTS}
         self.answer = self.answer_key = None
-        for n in SLOTS + ("A",):
+        self.answer_hist, self.answer_tries = [], 0
+        self.review = self.review_inputs = None
+        self.review_hist, self.review_tries = [], 0
+        self._last_clip = None
+        for n in ALL_SLOTS + ("A", ">>"):
             self.strip.set_stored(n, False)
-        if self.strip.box_src == "A":
+        if self.strip.box_src in ("A", "R"):
             self.strip.collapse()
         self.refresh_slots()
         self.status.set("New session: everything reset.")

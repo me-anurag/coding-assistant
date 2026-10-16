@@ -60,6 +60,61 @@ PART 2:
 """
 
 
+# Sent as a follow-up turn when the user presses "re" on the answer
+RETHINK_PROMPT = """\
+Your previous answer may be wrong or not optimal. Rethink the task carefully from scratch: re-read every \
+constraint, check the edge cases, and verify against the examples by hand. Then give the corrected final \
+answer in exactly the same format as before (only the code in one fenced block, or only the short answer). \
+Do not explain.
+"""
+
+# ---- "check my solution" (cc + er + >>)
+REVIEW_SYSTEM_PROMPT = """\
+You are a meticulous code reviewer and debugger.
+
+You receive:
+- TASK (optional): the problem the user is solving, copied from a web page in two parts.
+- USER SOLUTION: the code (or answer) the user wrote.
+- ERROR OUTPUT (optional): what the user got when running it (error message, wrong output, failed test).
+
+Find what is wrong in the USER SOLUTION and show exactly how to fix it.
+- If ERROR OUTPUT is given, find its exact cause first and fix it.
+- If no ERROR OUTPUT is given, the code ran without errors: check the logic, edge cases, constraints and \
+efficiency against the TASK.
+- If the solution is already correct and efficient, reply with only the VERDICT line.
+
+Reply in plain text (no markdown headings, no bold) in exactly this layout:
+VERDICT: <Correct | Has mistakes | Runs but gives wrong output | Too slow> (one short line)
+MISTAKES:
+1. <the line or snippet> -> <what is wrong and why>
+2. ...
+CORRECTED PART:
+<only the lines that must change, fixed, inside ONE fenced code block, keeping the user's names and \
+4-space indentation; if most of the code changes, give the complete corrected code>
+
+Be brief. No praise, no repeating the task.
+"""
+
+REVIEW_TEMPLATE = """\
+TASK:
+{task}
+
+USER SOLUTION:
+{cc}
+
+ERROR OUTPUT:
+{er}
+"""
+
+REVIEW_RETHINK_PROMPT = """\
+Your previous review may have missed something or been wrong. Re-check the user's solution line by line \
+(and the error output, if any) and give the corrected review in exactly the same layout as before.
+"""
+
+# keep only the most recent attempts when retrying (keeps requests small for free models)
+MAX_PREVIOUS = 2
+
+
 # ---------------------------------------------------------------- .env / config
 def load_env(force=False):
     """Read .env (next to this file). Uses python-dotenv if installed, else a tiny built-in parser."""
@@ -98,14 +153,6 @@ def load_config(force=False):
 
 
 # ---------------------------------------------------------------- request
-def build_messages(q, co, cfg, merge_system=False):
-    system = SYSTEM_PROMPT.replace("{language}", (cfg.get("language") or "Python 3").strip())
-    user = USER_TEMPLATE.replace("{q}", q.strip() or "(empty)").replace("{co}", co.strip() or "(empty)")
-    if merge_system:                      # some free models reject a separate system message
-        return [{"role": "user", "content": system + "\n\n" + user}]
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
-
-
 def _post(model, messages, cfg):
     key = (cfg.get("api_key") or "").strip()
     if not key:
@@ -173,13 +220,25 @@ def extract_answer(text):
     return answer.strip("\n")
 
 
-def solve(q, co, cfg=None):
-    """Combine q and co, ask the model (falling back to the next free model on failures),
-    return only the cleaned answer."""
-    cfg = cfg or load_config()
-    q, co = q or "", co or ""
-    if not q.strip() and not co.strip():
-        raise LLMError("Nothing stored in q or co.")
+def _with_system(system, turns, merge):
+    if merge:                                   # some free models reject a separate system message
+        first = dict(turns[0])
+        first["content"] = system + "\n\n" + first["content"]
+        return [first] + [dict(t) for t in turns[1:]]
+    return [{"role": "system", "content": system}] + [dict(t) for t in turns]
+
+
+def clean_review(text):
+    """Plain, readable review text: no hidden thinking, no markdown fences or bold markers."""
+    text = _THINK.sub("", (text or "")).replace("\r\n", "\n").replace("\r", "\n")
+    lines = [l for l in text.split("\n") if not l.strip().startswith("```")]
+    out = "\n".join(l.rstrip() for l in lines).replace("**", "").expandtabs(4)
+    return out.strip("\n")
+
+
+def _ask(system, turns, cfg, clean):
+    """Send the conversation, falling back to the next free model on retryable failures.
+    Returns the cleaned reply."""
     models = []
     for m in [cfg.get("model")] + list(cfg.get("fallbacks") or []):
         if m and m not in models:
@@ -188,8 +247,8 @@ def solve(q, co, cfg=None):
     for model in models:
         for merge in (False, True):                   # 2nd try: system prompt merged into the user message
             try:
-                data = _post(model, build_messages(q, co, cfg, merge_system=merge), cfg)
-                answer = extract_answer(_text_of(data))
+                data = _post(model, _with_system(system, turns, merge), cfg)
+                answer = clean(_text_of(data))
                 if answer:
                     return answer
                 last = LLMError(f"{model}: empty answer.", retryable=True)
@@ -201,3 +260,40 @@ def solve(q, co, cfg=None):
                 if "HTTP 400" not in str(e):          # only a 400 is worth the merged-prompt retry
                     break
     raise LLMError(f"All free models failed (tried {len(models)}). Last: {last}")
+
+
+def _task_text(q, co):
+    q, co = (q or "").strip(), (co or "").strip()
+    if not q and not co:
+        return "(not provided)"
+    return USER_TEMPLATE.replace("{q}", q or "(empty)").replace("{co}", co or "(empty)").strip()
+
+
+def solve(q, co, cfg=None, previous=None):
+    """Combine q and co and return only the cleaned answer.
+    previous = earlier answers to the same task: the model is told to rethink and answer again."""
+    cfg = cfg or load_config()
+    q, co = q or "", co or ""
+    if not q.strip() and not co.strip():
+        raise LLMError("Nothing stored in q or co.")
+    system = SYSTEM_PROMPT.replace("{language}", (cfg.get("language") or "Python 3").strip())
+    first = USER_TEMPLATE.replace("{q}", q.strip() or "(empty)").replace("{co}", co.strip() or "(empty)")
+    turns = [{"role": "user", "content": first}]
+    for prev in (previous or [])[-MAX_PREVIOUS:]:
+        turns += [{"role": "assistant", "content": prev}, {"role": "user", "content": RETHINK_PROMPT}]
+    return _ask(system, turns, cfg, extract_answer)
+
+
+def review(q, co, cc, er, cfg=None, previous=None):
+    """Check the user's own solution (cc), using the error output (er) if there is one.
+    q / co (the task) are optional context. Returns a plain-text review with the corrected part."""
+    cfg = cfg or load_config()
+    if not (cc or "").strip():
+        raise LLMError("Nothing stored in cc (your solution).")
+    er_text = (er or "").strip() or "(none - no error was reported; the code ran without errors)"
+    first = (REVIEW_TEMPLATE.replace("{task}", _task_text(q, co))
+             .replace("{cc}", cc.strip("\n")).replace("{er}", er_text))
+    turns = [{"role": "user", "content": first}]
+    for prev in (previous or [])[-MAX_PREVIOUS:]:
+        turns += [{"role": "assistant", "content": prev}, {"role": "user", "content": REVIEW_RETHINK_PROMPT}]
+    return _ask(REVIEW_SYSTEM_PROMPT, turns, cfg, clean_review)
